@@ -1,0 +1,10 @@
+.vscode/
+Example/
+GH-Tracker/
+Tools/
+build_log.txt
+build_log2.txt
+build_log3.txt
+build_output_utf8.txt
+build_output.txt
+Tracker.i

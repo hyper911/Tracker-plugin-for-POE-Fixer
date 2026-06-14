@@ -1,0 +1,1 @@
+d:\PTrade\POE_Fixer_Dev\Plugins\StatusTracker\Plugins\Tracker\bin\Release\status_icons.png
