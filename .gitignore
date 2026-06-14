@@ -8,3 +8,11 @@ build_log3.txt
 build_output_utf8.txt
 build_output.txt
 Tracker.i
+
+# Build artifacts
+Plugins/Tracker/bin/
+Plugins/Tracker/obj/
+*.pdb
+*.lib
+*.exp
+*.dll
