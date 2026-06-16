@@ -1,13 +1,18 @@
-// File: POEFixer/plugin_sdk/PluginSDK.h
+// PluginSDK.h — C++ wrapper for writing POEFixer plugins (SDK v6).
 //
-// Header-only C++ wrapper around the PluginAbi C ABI. Plugin authors
-// #include this and only this; all std::* types live entirely inside the
-// plugin DLL while only POD crosses the host/DLL boundary.
+// Writing a plugin:
+//   1. Subclass PluginSDK::Plugin, implement GetName() plus the hooks you need
+//      (OnEnable / DrawUI / DrawSettings / SaveSettings).
+//   2. Export a factory + deleter from your DLL:
+//        extern "C" PLUGIN_API PluginSDK::Plugin* CreatePlugin()            { return new MyPlugin(); }
+//        extern "C" PLUGIN_API void               DestroyPlugin(Plugin* p)  { delete p; }
+//      (PluginSDK_AttachHost is emitted for you when PLUGIN_EXPORTS is defined.)
+//   3. Build as an x64 DLL with PLUGIN_EXPORTS defined; drop it in Plugins/<Name>/.
 //
-// Build the plugin DLL with PLUGIN_EXPORTS defined to export the
-// PluginSDK_AttachHost symbol (defined inline below) alongside
-// CreatePlugin / DestroyPlugin.
-
+// Inside the plugin, reach the host through ctx(): ctx()->Game.GetSnapshot(),
+// ctx()->Entities.Enumerate(...), etc. Returned values are per-call copies and
+// their std::string fields are already materialized (safe to keep). To draw,
+// set ImGui's context from ctx()->ImGuiContext each frame.
 #pragma once
 
 #include "PluginAbi.h"
@@ -22,6 +27,7 @@
 #include <filesystem>
 #include <Windows.h>
 
+// dllexport while building the plugin (define PLUGIN_EXPORTS), dllimport elsewhere.
 #ifdef PLUGIN_EXPORTS
     #define PLUGIN_API __declspec(dllexport)
 #else
@@ -30,6 +36,7 @@
 
 namespace PluginSDK {
 
+// Strongly-typed mirrors of the Psdk* ABI enums in PluginAbi.h.
 enum class EntityType : int32_t {
     Unidentified      = PSDK_ENTITY_TYPE_UNIDENTIFIED,
     Chest             = PSDK_ENTITY_TYPE_CHEST,
@@ -119,6 +126,7 @@ enum class StatSource : int32_t {
     Buffs = PSDK_STAT_SOURCE_BUFFS,
 };
 
+// Host services — instances live on Context; reach them via ctx() in a Plugin.
 class GameService;
 class EntitiesService;
 class ComponentsService;
@@ -134,9 +142,9 @@ class FlasksService;
 class Plugin;
 struct Context;
 
-// Materialize a UTF-8 / wide string the ABI exposed only by address.
-// Two-call protocol: first call with bufsize=0 returns the required byte
-// count (incl. trailing null), then the second call fills the buffer.
+// Copy a host-owned string/wstring (by address) into an owned value. The
+// wrapper structs below call these for you, so their std::string fields are
+// already resolved and safe to keep past the call.
 inline std::string FetchString(uintptr_t addr, const HostAbi* abi) {
     if (!addr || !abi || !abi->memory.read_string) return {};
     size_t needed = abi->memory.read_string(addr, nullptr, 0);
@@ -156,6 +164,12 @@ inline std::wstring FetchWString(uintptr_t addr, const HostAbi* abi) {
     abi->memory.read_wstring(addr, s.data(), needed);
     return s;
 }
+
+// ---------------------------------------------------------------------------
+// Owned views of the ABI PODs. Each ::FromAbi() copies out of the host struct
+// and resolves string addresses, so instances are self-contained and safe to
+// store. Field meanings match the matching *Abi struct in PluginAbi.h.
+// ---------------------------------------------------------------------------
 
 struct Vital {
     int   Current = 0;
@@ -457,6 +471,8 @@ struct Stats {
     }
 };
 
+// Animation state only. For a unit's current action (casting/target cell) use
+// ComponentsService::ReadActorAction instead.
 struct Actor {
     std::string AnimationName;
     int         AnimationId = 0;
@@ -470,6 +486,29 @@ struct Actor {
         return ac;
     }
 };
+
+// A unit's current action: Flags bitmask (IsUsingAbility() tests bit 0x400)
+// plus the target grid cell. From ComponentsService::ReadActorAction.
+struct ActorAction {
+    int  Flags = 0;
+    int  DestX = 0;
+    int  DestY = 0;
+    bool Valid = false;
+
+    bool IsUsingAbility() const { return (Flags & 0x400) != 0; }
+
+    static ActorAction FromAbi(const ActorActionAbi& a) {
+        ActorAction r;
+        r.Flags = a.flags;
+        r.DestX = a.dest_x;
+        r.DestY = a.dest_y;
+        r.Valid = a.valid != 0;
+        return r;
+    }
+};
+
+// One waypoint (grid cell) of a movement route from ComponentsService::ReadPathfinding.
+struct PathNode { int X = 0; int Y = 0; };
 
 struct Npc {
     uintptr_t EntityOwnerAddress = 0;
@@ -517,8 +556,6 @@ struct Buff {
     }
 };
 
-// Component marker; the actual buff list comes from
-// ComponentsService::EnumerateBuffs.
 struct Buffs {
     bool Valid = false;
 
@@ -538,34 +575,22 @@ struct ActiveSkill {
     int  TotalCooldownMs = 0;
     bool CanBeUsed = false;
 
-    // === append-only extensions (added 2026-05-23) ===
-    int  MaxUses = 0;                   // 0 if not cooldown-bound
-    int  TotalActiveCooldowns = 0;      // remaining charges = MaxUses - this (when MaxUses > 0)
-    uint32_t  EquipmentInfoPacked = 0;  // also decoded into Equipment below
+    int  MaxUses = 0;
+    int  TotalActiveCooldowns = 0;
+    uint32_t  EquipmentInfoPacked = 0;
     uintptr_t GrantedEffectsPerLevelAddr = 0;
     uintptr_t ActiveSkillsDatAddr = 0;
     uintptr_t GrantedEffectStatSetsPerLevelAddr = 0;
-    uintptr_t SkillDetailsAddr = 0;     // pass to ctx->Memory.Read for further DAT fields
+    uintptr_t SkillDetailsAddr = 0;
 
-    // Decoded equipment info. Bit layout mirrors GameHelper2's
-    // GameHelper/Utils/MiscHelper.cs `ActiveSkillGemDataParser` exactly.
     struct EquipmentInfo {
-        uint32_t  GemNameHash = 0;       // packed >> 0x10              (upper 16 bits)
-        int       InventorySlot = 0;     // (low16 & 0x7F) + 1          (1-based InventoryName-ish)
-        int       LinkIndex = 0;         // (low16 >> 7) & 0x07
-        int       SocketIndex = 0;       // (low16 >> 10) & 0x07
-        int       UnknownFlag = 0;       // (low16 >> 13) & 0x03        ("something vaal related" per GameHelper2)
-        bool      CanBeOnPlayerItem = false; // (low16 >> 15) > 0       (residual bit after the above shifts)
+        uint32_t  GemNameHash = 0;
+        int       InventorySlot = 0;
+        int       LinkIndex = 0;
+        int       SocketIndex = 0;
+        int       UnknownFlag = 0;
+        bool      CanBeOnPlayerItem = false;
     } Equipment;
-
-    // NOTE on safe field access: ActiveSkillAbi is an append-only callback
-    // payload struct. We always read the full plan-version layout here
-    // because the plugin DLL and host build against the same checked-out
-    // PluginSDK.h / PluginAbi.h pair (PluginManager already verifies version
-    // and size_bytes >= sizeof(HostAbi) at attach time). For plugins built
-    // against an older PluginSDK.h, the older FromAbi simply reads fewer
-    // fields — that's fine because the host still writes the larger struct
-    // and the older code ignores the trailing bytes.
 
     static ActiveSkill FromAbi(const ActiveSkillAbi& a, const HostAbi* abi) {
         ActiveSkill s;
@@ -577,7 +602,6 @@ struct ActiveSkill {
         s.CanBeUsed       = a.can_be_used != 0;
         s.Name            = FetchString(a.name_addr, abi);
 
-        // Extensions
         s.MaxUses                          = a.max_uses;
         s.TotalActiveCooldowns             = a.total_active_cooldowns;
         s.EquipmentInfoPacked              = a.equipment_info_packed;
@@ -586,7 +610,6 @@ struct ActiveSkill {
         s.GrantedEffectStatSetsPerLevelAddr = a.granted_effect_stat_sets_per_level_addr;
         s.SkillDetailsAddr                 = a.skill_details_addr;
 
-        // Decode packed equipment info (MiscHelper.cs:24-49 line-for-line).
         uint32_t packed = a.equipment_info_packed;
         s.Equipment.GemNameHash   = packed >> 0x10;
         uint32_t low = packed & 0x0000FFFF;
@@ -608,7 +631,7 @@ struct Mod {
     std::string Name;
     std::string StatKey;
     std::string AffixName;
-    int   GenerationType = 0;  // 1=Prefix, 2=Suffix, 3=Implicit
+    int   GenerationType = 0;
     float Value0 = 0.f;
     float Value1 = 0.f;
     ModKind Kind = ModKind::Implicit;
@@ -626,9 +649,6 @@ struct Mod {
     }
 };
 
-// Per-entity item-mod aggregate. Distinct from `Mods` (the component POD);
-// this adds the per-kind mod lists exposed by
-// InventoryService::ReadItemMods(entityAddr).
 struct ItemMods {
     int Rarity = 0;
     int ItemLevel = 0;
@@ -646,6 +666,29 @@ struct ItemMods {
     std::vector<Mod> HellscapeMods;
     std::vector<Mod> CrucibleMods;
     bool Valid = false;
+};
+
+// One monster modifier from an ObjectMagicProperties component
+// (ComponentsService::EnumerateMonsterMods). Match on Id (most stable),
+// Metadata, or a hash. Metadata is empty for non-monster mods.
+struct MonsterMod {
+    std::string Id;        // Mods.dat Id, e.g. "MonsterAbyssLightlessFaction1"
+    std::string Name;      // Mods.dat Name (display), e.g. "Abyssal"
+    std::string Metadata;  // Mods.dat MonsterMetadata, e.g. "Metadata/.../LightlessWells"
+    uint16_t    Hash16 = 0;          // e.g. 0x63D1
+    uint32_t    Hash32 = 0;          // e.g. 0xBFDA2A36
+    int         GenerationType = 0;  // 1=Prefix 2=Suffix 3=Implicit
+
+    static MonsterMod FromAbi(const MonsterModAbi& a, const HostAbi* abi) {
+        MonsterMod m;
+        m.Id             = FetchString(a.id_addr, abi);
+        m.Name           = FetchString(a.display_name_addr, abi);
+        m.Metadata       = FetchString(a.metadata_addr, abi);
+        m.Hash16         = a.hash16;
+        m.Hash32         = a.hash32;
+        m.GenerationType = a.generation_type;
+        return m;
+    }
 };
 
 struct UiElement {
@@ -687,7 +730,7 @@ struct UiElement {
 
 struct MapTransform {
     float CenterX = 0, CenterY = 0;
-    float ScaleX = 0, ScaleY = 0;  // pre-multiplied cos/sin
+    float ScaleX = 0, ScaleY = 0;
     float PlayerGridX = 0, PlayerGridY = 0;
     bool  IsVisible = false;
 
@@ -792,6 +835,12 @@ struct InventoryItem {
     std::string BaseTypeName;
     std::string UniqueName;
 
+    float     ScreenX = 0.0f;
+    float     ScreenY = 0.0f;
+    float     ScreenW = 0.0f;
+    float     ScreenH = 0.0f;
+    bool      ScreenValid = false;
+
     static InventoryItem FromAbi(const InventoryItemAbi& a, const HostAbi* abi) {
         InventoryItem i;
         i.Address          = a.address;
@@ -810,6 +859,11 @@ struct InventoryItem {
         i.Path             = FetchString(a.path_addr, abi);
         i.BaseTypeName     = FetchString(a.base_type_name_addr, abi);
         i.UniqueName       = FetchString(a.unique_name_addr, abi);
+        i.ScreenX          = a.screen_x;
+        i.ScreenY          = a.screen_y;
+        i.ScreenW          = a.screen_w;
+        i.ScreenH          = a.screen_h;
+        i.ScreenValid      = a.screen_valid != 0;
         return i;
     }
 };
@@ -902,8 +956,6 @@ struct Inventory {
     InventoryGrid Grid;
     std::vector<InventoryItem> Items;
 
-    // FromAbi populates everything except Items; use
-    // InventoryService::GetItems to materialize the item list.
     static Inventory FromAbi(const InventoryAbi& a) {
         Inventory i;
         i.InventoryId          = a.inventory_id;
@@ -919,8 +971,8 @@ struct Inventory {
     }
 };
 
-// Component addresses for one entity. Zero = entity does not carry that
-// component.
+// Per-entity component addresses (0 = absent). Pass a non-zero member to the
+// matching ComponentsService::Read* call; HasX() are convenience checks.
 struct ComponentAddresses {
     uintptr_t Render = 0, Positioned = 0, Life = 0, Targetable = 0;
     uintptr_t Chest = 0, Shrine = 0, Player = 0, Npc = 0;
@@ -988,6 +1040,8 @@ struct ComponentAddresses {
 
 using EntityComponents = ComponentAddresses;
 
+// One entity. Address identifies it (pass to ReadPathfinding etc.); Components
+// holds its component addresses; grid vs world coords are both provided.
 struct Entity {
     uint32_t  Id = 0;
     uintptr_t Address = 0;
@@ -1049,6 +1103,8 @@ struct Entity {
     }
 };
 
+// One frame of world state from GameService::GetSnapshot(). Entities/inventories
+// /buffs are not inline — enumerate them through their services.
 struct Snapshot {
     GameState   State = GameState::NotLoaded;
     std::string CurrentAreaName;
@@ -1126,13 +1182,7 @@ struct ScreenSize {
     float Height = 0;
 };
 
-// Service wrappers below all follow the same C-trampoline pattern: each
-// `Enumerate*` allocates a captures struct on the stack, the C ABI receives
-// a `+[](...) -> int32_t { ... }` lambda (no captures, so it decays to a
-// function pointer), and that lambda reinterprets userdata back to the
-// captures struct. Returning 1 from the trampoline keeps enumeration going;
-// 0 stops it.
-
+// World/engine state and the per-frame snapshot. Reached as ctx()->Game.
 class GameService {
     const GameServiceAbi* m_abi = nullptr;
     const HostAbi*     m_host = nullptr;
@@ -1170,6 +1220,8 @@ public:
     }
 };
 
+// Enumerate / look up entities; Watch() keeps a component map fresh across
+// frames. Reached as ctx()->Entities.
 class EntitiesService {
     const EntitiesServiceAbi* m_abi = nullptr;
     const HostAbi*         m_host = nullptr;
@@ -1224,15 +1276,6 @@ public:
         return ComponentAddresses::FromAbi(raw);
     }
 
-    // Resolve a WorldItem container entity into its inner item entity.
-    // Returns std::nullopt if the address is not a WorldItem container,
-    // the inner item is not yet resolved, or any read fails.
-    // The returned Entity has its Components field populated with the
-    // inner item's component addresses (Mods, Base, Stack, Sockets, ...).
-    //
-    // NOTE: this routes through m_host (HostAbi top-level pointer), not
-    // m_abi (EntitiesServiceAbi), so we can grow the SDK surface without
-    // shifting any inner-service-struct offsets — preserves v6 ABI compat.
     std::optional<Entity> GetWorldItemInner(uintptr_t containerAddr) const {
         if (!m_host || !m_host->get_world_item_inner || containerAddr == 0)
             return std::nullopt;
@@ -1244,6 +1287,8 @@ public:
     }
 };
 
+// Read a single component from its address, or walk the list-valued ones
+// (buffs / active skills / stats / mods). Reached as ctx()->Components.
 class ComponentsService {
     const ComponentsServiceAbi* m_abi = nullptr;
     const HostAbi*           m_host = nullptr;
@@ -1368,6 +1413,33 @@ public:
             return Actor::FromAbi(a, m_host);
         return {};
     }
+
+    // Movement route as grid waypoints. Pass the ENTITY address (Entity::Address),
+    // not a component address; empty if the unit isn't moving / not in the snapshot.
+    std::vector<PathNode> ReadPathfinding(uintptr_t entityAddr) const {
+        std::vector<PathNode> out;
+        if (!m_host || !m_host->read_pathfinding || entityAddr == 0) return out;
+        PathfindingAbi a{};
+        if (!m_host->read_pathfinding(entityAddr, &a) || a.valid == 0) return out;
+        int count = a.node_count;
+        if (count < 0) count = 0;
+        if (count > 64) count = 64;
+        out.reserve(static_cast<size_t>(count));
+        for (int i = 0; i < count; ++i)
+            out.push_back(PathNode{ a.nodes[i].x, a.nodes[i].y });
+        return out;
+    }
+
+    // Current action (flags + target cell). Pass the Actor component address
+    // (Entity::Components.Actor).
+    ActorAction ReadActorAction(uintptr_t actorAddr) const {
+        if (m_host && m_host->read_actor_action && actorAddr != 0) {
+            ActorActionAbi a{};
+            if (m_host->read_actor_action(actorAddr, &a))
+                return ActorAction::FromAbi(a);
+        }
+        return {};
+    }
     Npc ReadNpc(uintptr_t addr) const {
         NpcAbi a{};
         if (m_abi && m_abi->read_npc && m_abi->read_npc(addr, &a))
@@ -1450,6 +1522,26 @@ public:
         return out;
     }
 
+    // Enumerate a monster's rolled mods from its ObjectMagicProperties
+    // component address (Entity::Components.OMP). Lets a plugin identify a
+    // monster's modifiers the instant it spawns — before any related buff is
+    // applied. Empty if the unit has no OMP component / no mods. Match on
+    // MonsterMod::Id (most stable), Metadata, or Hash16/Hash32.
+    std::vector<MonsterMod> EnumerateMonsterMods(uintptr_t ompAddr) const {
+        std::vector<MonsterMod> out;
+        if (!m_host || !m_host->enumerate_monster_mods || ompAddr == 0) return out;
+        struct Ctx { std::vector<MonsterMod>* out; const HostAbi* host; };
+        Ctx c{ &out, m_host };
+        m_host->enumerate_monster_mods(ompAddr,
+            [](const MonsterModAbi* m, void* ud) -> int32_t {
+                auto* p = static_cast<Ctx*>(ud);
+                p->out->push_back(MonsterMod::FromAbi(*m, p->host));
+                return 1;
+            },
+            &c);
+        return out;
+    }
+
     float GetHealthPercent(uintptr_t lifeAddr) const {
         Life l = ReadLife(lifeAddr);
         return (l.Valid && l.Health.Total > 0)
@@ -1498,6 +1590,7 @@ public:
     }
 };
 
+// Inventories, their items, and item-detail lookups. Reached as ctx()->Inventory.
 class InventoryService {
     const InventoryServiceAbi* m_abi = nullptr;
     const HostAbi*          m_host = nullptr;
@@ -1646,6 +1739,8 @@ public:
     }
 };
 
+// Walk the game's UI tree (children, paths, visibility, screen rects).
+// Reached as ctx()->Ui.
 class UiService {
     const UiServiceAbi* m_abi = nullptr;
     const HostAbi*   m_host = nullptr;
@@ -1668,7 +1763,7 @@ public:
         struct Ctx { std::vector<uintptr_t>* out; };
         Ctx c{ &out };
         m_abi->enumerate_children(addr,
-            [](uintptr_t child, int32_t /*idx*/, void* ud) -> int32_t {
+            [](uintptr_t child, int32_t , void* ud) -> int32_t {
                 auto* p = static_cast<Ctx*>(ud);
                 p->out->push_back(child);
                 return 1;
@@ -1717,6 +1812,22 @@ public:
         return m_abi->compute_screen_rect(addr, &x, &y, &w, &h) != 0;
     }
 
+    struct ScreenRect { float x = 0, y = 0, w = 0, h = 0; bool ok = false; };
+
+    // Batch variant of ComputeScreenRect. Returns one ScreenRect per input addr
+    // (same order). Empty / all-not-ok if the host is too old to provide it.
+    std::vector<ScreenRect> ComputeScreenRects(const std::vector<uintptr_t>& addrs) const {
+        std::vector<ScreenRect> out(addrs.size());
+        // compute_screen_rects lives on the HostAbi tail (see PluginAbi.h), so it
+        // is reached through m_host, not m_abi. Old hosts leave it null -> all not-ok.
+        if (!m_host || !m_host->compute_screen_rects || addrs.empty()) return out;
+        std::vector<PsdkScreenRectAbi> tmp(addrs.size());
+        m_host->compute_screen_rects(addrs.data(), static_cast<int32_t>(addrs.size()), tmp.data());
+        for (size_t i = 0; i < addrs.size(); ++i)
+            out[i] = { tmp[i].x, tmp[i].y, tmp[i].w, tmp[i].h, tmp[i].ok != 0 };
+        return out;
+    }
+
     uintptr_t GetGameUiRoot() const {
         return (m_abi && m_abi->get_game_ui_root) ? m_abi->get_game_ui_root() : 0;
     }
@@ -1733,6 +1844,8 @@ public:
     }
 };
 
+// Project world/grid coordinates to screen and to the large/mini map.
+// Reached as ctx()->Render.
 class RenderService {
     const RenderServiceAbi* m_abi = nullptr;
     const HostAbi*       m_host = nullptr;
@@ -1769,10 +1882,7 @@ public:
     }
 };
 
-// RAII handle around a terrain-grid snapshot. Move-only: the held buffer
-// must be released exactly once via the ABI's release() callback. Always
-// bound-check indices against SizeBytes() / ElementCount() — the underlying
-// storage is the host's atomic snapshot, not a live pointer.
+// RAII view over a walkable-grid snapshot; releases the host buffer on destruct.
 class WalkableGridHandle {
     WalkableGridHandleAbi m_h{};
 public:
@@ -1800,8 +1910,6 @@ public:
     int Height() const { return m_h.height; }
     bool Valid() const { return m_h.data != nullptr; }
 
-    // Buffer size in bytes. Walkable grid is 4-bit-per-tile packed
-    // (two tiles per byte), so size = (Width * Height) / 2.
     size_t SizeBytes() const {
         if (m_h.width <= 0 || m_h.height <= 0) return 0;
         return (static_cast<size_t>(m_h.width)
@@ -1809,6 +1917,7 @@ public:
     }
 };
 
+// RAII view over a height-grid snapshot; releases the host buffer on destruct.
 class HeightGridHandle {
     HeightGridHandleAbi m_h{};
 public:
@@ -1836,7 +1945,6 @@ public:
     int Height() const { return m_h.height; }
     bool Valid() const { return m_h.data != nullptr; }
 
-    // Height grid is one float per tile, unpacked.
     size_t ElementCount() const {
         if (m_h.width <= 0 || m_h.height <= 0) return 0;
         return static_cast<size_t>(m_h.width)
@@ -1845,6 +1953,7 @@ public:
     size_t SizeBytes() const { return ElementCount() * sizeof(float); }
 };
 
+// Walkability, terrain height, and loaded tile locations. Reached as ctx()->Terrain.
 class TerrainService {
     const TerrainServiceAbi* m_abi = nullptr;
     const HostAbi*        m_host = nullptr;
@@ -1893,6 +2002,8 @@ public:
     }
 };
 
+// Raw reads from the game process (bytes / strings / std::vector / patterns).
+// Reached as ctx()->Memory.
 class MemoryService {
     const MemoryServiceAbi* m_abi = nullptr;
     const HostAbi*       m_host = nullptr;
@@ -1919,8 +2030,6 @@ public:
         return s;
     }
 
-    // ReadStdVector: caller knows element size + count expectations.
-    // Returns the raw bytes (count * elementSize) so the caller can reinterpret_cast.
     std::vector<uint8_t> ReadStdVector(uintptr_t containerAddr, int elementSize,
                                        int maxElements = 1024) const {
         if (!m_abi || !m_abi->read_std_vector || elementSize <= 0) return {};
@@ -1945,6 +2054,7 @@ public:
     }
 };
 
+// Write to the host log (Info / Warn / Error). Reached as ctx()->Log.
 class LogService {
     const LogServiceAbi* m_abi = nullptr;
     const HostAbi*    m_host = nullptr;
@@ -1963,9 +2073,8 @@ public:
     void Error(const char* message) const { Log("Error",   message); }
 };
 
-// Event subscriptions store heap-allocated std::function holders keyed by
-// token. The destructor unsubscribes any remaining tokens and frees the
-// holders — the EventsService instance must outlive every callback it owns.
+// Subscribe to host events (area change, frame, attach/detach); the returned
+// Token unsubscribes on destruct. Reached as ctx()->Events.
 class EventsService {
     const EventsServiceAbi* m_abi = nullptr;
     std::map<uint64_t, std::function<void()>*> m_holders;
@@ -1975,7 +2084,7 @@ public:
         bool Valid() const { return Value != 0; }
     };
 
-    void Init(const EventsServiceAbi* abi, const HostAbi* /*host*/) {
+    void Init(const EventsServiceAbi* abi, const HostAbi* ) {
         m_abi = abi;
     }
 
@@ -2031,41 +2140,12 @@ public:
     }
 };
 
-// ============================================================================
-// OverlayService — per-plugin influence on overlay/data behavior
-// ============================================================================
-//
-// Two independent, idempotent "request flags" that a plugin can toggle to
-// change overlay-wide behavior for its own use case. Both follow the same
-// shape:
-//
-//     ctx()->Overlay.SetX(true);   // I want X
-//     ...
-//     ctx()->Overlay.SetX(false);  // I no longer want X
-//
-// The host stores per-plugin flags (keyed by your plugin `this`) and computes
-// the effective behavior as the OR of:
-//   - all enabled plugins' flags,
-//   - the host's own built-in needs (main menu visible, Radar's built-in
-//     "Add Entity from Map" picker, AutoCraft lock, etc.).
-//
-// Multiple plugins can request the same thing simultaneously without
-// interfering. The host clears all of a plugin's flags when it disables or
-// unloads the plugin — so a crash or a forgotten cleanup will NOT permanently
-// stick the overlay/data in the requested state. Well-behaved plugins still
-// pair their on/off calls so neighboring plugins and the player remain
-// responsive in the meantime.
-//
-// Latency: a Set call updates the per-plugin flag synchronously, but the
-// effective behavior change manifests on the next host frame (overlay
-// input) or the next GameClient worker tick (sleeping entities). For
-// typical plugin workflows the lag is sub-frame and unobservable.
-//
-// All methods are safe to call from any thread.
+// Per-plugin overlay requests (receive sleeping entities, capture overlay
+// input). Auto-cleared on unload. Reached as ctx()->Overlay.
 class OverlayService {
     const OverlayServiceAbi* m_abi = nullptr;
     const HostAbi*           m_host = nullptr;
-    void*                    m_plugin_token = nullptr;  // = Plugin*, opaque to host
+    void*                    m_plugin_token = nullptr;
 public:
     void Init(const OverlayServiceAbi* abi, const HostAbi* host, void* token) {
         m_abi          = abi;
@@ -2073,150 +2153,12 @@ public:
         m_plugin_token = token;
     }
 
-    // ── Gap 1: SetIncludeSleepingEntities ───────────────────────────────────
-    //
-    // Background
-    //   PoE2 keeps a large pool of far-away or dormant entities live in memory
-    //   but flagged "Useless" (EntityState::Useless). To keep snapshot cost
-    //   bounded, the host hides Useless entities from EntitiesService.Enumerate
-    //   by default — plugins only see active, nearby entities.
-    //
-    // Effect when enabled
-    //   Useless entities also appear in EntitiesService.Enumerate and
-    //   Snapshot.Entities. The Entity::IsSleeping flag marks specifically
-    //   those entities that came from the host's separate SleepingEntities
-    //   collection (orthogonal to EntityState::Useless — many entities are
-    //   Useless without being in that collection).
-    //
-    // When to use
-    //   - Map-picker UIs that need the full area entity pool (so you can let
-    //     the user click on an entity that's not yet active).
-    //   - Debug viewers showing every entity, sleeping or not.
-    //
-    // Cost
-    //   Roughly +5–15% snapshot CPU per frame in dense areas while enabled.
-    //   Negligible while disabled (default). Leave OFF unless you need it.
-    //
-    // Lifecycle
-    //   Idempotent. Auto-cleared on plugin disable/unload. Pair on/off calls.
     void SetIncludeSleepingEntities(bool enable) const {
         if (m_abi && m_abi->set_include_sleeping_entities) {
             m_abi->set_include_sleeping_entities(m_plugin_token, enable ? 1 : 0);
         }
     }
 
-    // ── Gap 2: SetWantsOverlayInput ─────────────────────────────────────────
-    //
-    // Request that the overlay window starts CONSUMING mouse clicks (so your
-    // ImGui windows / popups receive them) instead of letting them pass
-    // through to the game underneath.
-    //
-    // ## Background — what "input capture" actually means here
-    //
-    // The overlay window is a transparent always-on-top child sitting on top
-    // of the PoE2 client window. In its default state it has the Win32 style
-    // WS_EX_TRANSPARENT: every mouse click passes straight through to the
-    // game underneath. This is the correct default for read-only overlays
-    // (radar, health-bar tracker, DPS readout) — the player keeps playing
-    // normally and never notices the overlay is there.
-    //
-    // The moment a plugin wants the user to CLICK ON SOMETHING INSIDE THE
-    // OVERLAY — confirm a popup button, pick an entity on the map, drag a
-    // marker, dismiss a modal — that default breaks: the click would land in
-    // the game and your popup would never see it. SetWantsOverlayInput(true)
-    // fixes this for the duration of your interactive mode.
-    //
-    // ## Effect when enabled
-    //
-    // The host's overlay input loop runs every frame. While ANY plugin (or
-    // the host itself) has this flag on:
-    //
-    //   - If the OS cursor is over a visible ImGui window owned by you or
-    //     any other plugin/host UI, the overlay temporarily clears
-    //     WS_EX_TRANSPARENT and the click is delivered to ImGui (and NOT to
-    //     the game). Your ImGui::Begin(...) window receives clicks normally.
-    //
-    //   - If the cursor is NOT over any visible ImGui window — the player is
-    //     clicking on the world — WS_EX_TRANSPARENT is restored and the click
-    //     reaches the game. Movement, attacks, looting all keep working.
-    //
-    // This per-frame "claim only what the user is actually over" behavior is
-    // what makes a heavy interactive overlay coexist with active gameplay.
-    //
-    // ## Scope — what this flag does and does NOT affect
-    //
-    //   - Mouse buttons (LMB/RMB): YES, gated by this flag.
-    //   - Mouse position / hover: ALWAYS works, regardless of this flag.
-    //     Tooltips and hover effects don't need this.
-    //   - Keyboard: ALWAYS reaches the plugin via the host's WindowProc, not
-    //     gated by this flag. ImGui::IsKeyPressed(ImGuiKey_Escape) etc. work
-    //     either way.
-    //   - Game input: only loses clicks where your ImGui window covers them.
-    //     The player can keep playing around your popup.
-    //
-    // ## Background-draw-list caveat — READ THIS for map-picker plugins
-    //
-    // If you draw clickable markers via ImGui::GetBackgroundDrawList() (typical
-    // for radar/large-map overlays), the background list has no ImGui window
-    // backing it. The host's "is the cursor over UI?" check walks the ImGui
-    // window list and finds nothing → click-through is re-enabled and your
-    // background-list click goes to the game.
-    //
-    // To make background-list clicks work, you need a real ImGui window the
-    // host's hit-test recognizes (HitTestInternal in radar/render/render.cpp
-    // iterates ctx->Windows; ImGui widgets like InvisibleButton are inside a
-    // window, not windows themselves). Choose one:
-    //
-    //   1. (RECOMMENDED) Open a full-screen ImGui window with no decoration
-    //      and put an InvisibleButton inside it. The window is what the host
-    //      hit-tests; the InvisibleButton gives you ImGui::IsItemClicked()
-    //      for click detection. Sketch:
-    //
-    //          ImGui::SetNextWindowPos({0, 0});
-    //          ImGui::SetNextWindowSize(screenSize);
-    //          ImGui::Begin("##picker", nullptr,
-    //              ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoTitleBar |
-    //              ImGuiWindowFlags_NoMove       | ImGuiWindowFlags_NoResize    |
-    //              ImGuiWindowFlags_NoScrollbar);
-    //          ImGui::InvisibleButton("##picker_hit", screenSize);
-    //          bool clicked = ImGui::IsItemClicked();
-    //          // ... draw markers via ImGui::GetForegroundDrawList() or
-    //          //     GetWindowDrawList(); do your world-space hit-test against
-    //          //     markers using ImGui::GetMousePos() vs marker screen pos ...
-    //          ImGui::End();
-    //
-    //   2. Same idea with a smaller window covering only the picker region
-    //      instead of full-screen. Pick whichever fits — the host doesn't
-    //      care about size, only that some window is under the cursor.
-    //
-    // ## When to use
-    //
-    //   - Plugin opens an ImGui popup/modal the user must click.
-    //   - Map-picker flows: click on an entity / POI marker.
-    //   - Drag-to-position UI for radar icons, custom overlays.
-    //
-    // ## When NOT to use
-    //
-    //   - Read-only overlays — leave OFF so the player isn't interrupted.
-    //   - Hover-only tooltips — ImGui hover always works.
-    //
-    // ## Aggregation across plugins and host
-    //
-    // OR'd with the host's built-in needs (main menu visible, AutoCraft locked,
-    // host's own map picker active) and every other plugin's flag. Multiple
-    // simultaneous requests coexist fine. The effective state is recomputed
-    // every frame from the aggregate.
-    //
-    // ## Lifecycle
-    //
-    // Remember to call SetWantsOverlayInput(false) when your interactive mode
-    // ends (user picked / pressed Escape / closed the popup). The host clears
-    // all of a plugin's flags automatically on OnDisable / unload, so a crash
-    // or a forgotten cleanup will NOT permanently stick the overlay in capture
-    // mode — but well-behaved plugins still pair their on/off calls so other
-    // plugins and the game stay responsive in between.
-    //
-    // Idempotent. Safe from any thread.
     void SetWantsOverlayInput(bool enable) const {
         if (m_abi && m_abi->set_wants_overlay_input) {
             m_abi->set_wants_overlay_input(m_plugin_token, enable ? 1 : 0);
@@ -2224,6 +2166,8 @@ public:
     }
 };
 
+// The utility belt: life/mana flasks and charms in slot order (empty =>
+// Valid==false). Reached as ctx()->Flasks.
 class FlasksService {
     const FlasksServiceAbi* m_abi = nullptr;
     const HostAbi*          m_host = nullptr;
@@ -2233,8 +2177,6 @@ public:
         m_host = host;
     }
 
-    // GetFlask/GetCharm: returns nullopt on out-of-range or not-in-game.
-    // Empty slot returns Flask{ Valid=false, ... } (still a Flask wrapper).
     std::optional<Flask> GetFlask(int32_t slot) const {
         if (!m_abi || !m_abi->get_flask) return std::nullopt;
         FlaskAbi a{};
@@ -2287,6 +2229,7 @@ public:
     }
 };
 
+// Bundles the host services plus the ImGui/D3D handles. Accessed via Plugin::ctx().
 struct Context {
     GameService       Game;
     EntitiesService   Entities;
@@ -2304,62 +2247,57 @@ struct Context {
     void* D3DDevice    = nullptr;
 };
 
-}  // namespace PluginSDK
+}
 
-// Forward-declared in the global namespace so PluginSDK::Plugin's friend
-// declaration can name it. Inline definition lives at the bottom of this file.
+// Wires the host ABI into a plugin instance. Auto-emitted in your DLL when
+// PLUGIN_EXPORTS is defined (the inline definition is at the bottom of this
+// file) — you never call this yourself.
 extern "C" PLUGIN_API void PluginSDK_AttachHost(
     PluginSDK::Plugin* p, const HostAbi* abi, const char* directory);
 
 namespace PluginSDK {
 
+// Base class for every plugin. Subclass it, implement GetName(), and override
+// the hooks you need. The host owns the instance (created via your exported
+// CreatePlugin) — never delete it yourself. Reach the host through ctx().
 class Plugin {
 public:
     virtual ~Plugin() = default;
 
-    /// Display name shown in the host's Plugins settings tab. Must be ASCII.
+    // Required: a unique, stable plugin name.
     virtual const char* GetName() const = 0;
 
-    /// Called once after construction + host attach. Load settings here.
-    /// @param isGameAttached true if game process is already attached.
-    virtual void OnEnable(bool /*isGameAttached*/) {}
+    // Enabled (arg = the game is already attached). Acquire resources / load config.
+    virtual void OnEnable(bool ) {}
 
-    /// Called when the user disables the plugin. Free resources here.
+    // Disabled or unloaded. Release resources and persist state.
     virtual void OnDisable() {}
 
-    /// Called every frame on the Plugin settings tab to render ImGui config UI.
+    // Draw your controls inside the host's plugin-settings window.
     virtual void DrawSettings() {}
 
-    /// Called every frame on the main render loop when the plugin is enabled.
+    // Draw every frame (overlay + windows). Set ImGui's context from
+    // ctx()->ImGuiContext first; gate work on ctx()->Game.IsInGame() as needed.
     virtual void DrawUI() {}
 
-    /// Called periodically (~5s) and on disable. Persist settings to disk here.
+    // Persist configuration; the host may call this on shutdown.
     virtual void SaveSettings() {}
 
-    /// Return true if this plugin wants the host to be in overlay mode.
+    // Return true if DrawUI renders an in-game overlay (vs. windows only).
     virtual bool WantsOverlay() const { return false; }
 
-    /// SDK version this plugin was built against. DO NOT override.
+    // ABI version this plugin was built against; the host checks it on load.
     int GetSDKVersion() const { return PLUGIN_SDK_VERSION; }
 
 protected:
-    /// Access to host services. Valid after PluginSDK_AttachHost, before OnEnable.
+
+    // The host API. Call services as ctx()->Game, ctx()->Entities, etc.
     const Context* ctx() const { return &m_ctx; }
 
-    /// Absolute path to this plugin's directory (Plugins/<Name>/). UTF-8.
+    // This plugin's folder as UTF-8. Prefer DirectoryPath() for a Unicode-safe
+    // path when loading/saving files next to the DLL.
     const char* Directory() const { return m_directory.c_str(); }
 
-    /// Same as Directory() but returned as std::filesystem::path with the
-    /// proper UTF-8 → wide conversion baked in. Use this whenever you need
-    /// to construct fs::path / std::ifstream / CreateDirectoryW etc.
-    ///
-    /// Why: fs::path(std::string) on Windows interprets the string via the
-    /// system ANSI codepage, NOT UTF-8. If the host's exe lives in a folder
-    /// with non-ASCII chars (Cyrillic, CJK, …) and the system ACP isn't
-    /// UTF-8, the bytes get misinterpreted → mojibake wide path → file
-    /// operations land on the wrong location (often creating a sibling
-    /// folder with garbled name next to the real one). Going through
-    /// CP_UTF8 → wide → fs::path keeps the original chars intact.
     std::filesystem::path DirectoryPath() const {
         if (m_directory.empty()) return {};
         int needed = ::MultiByteToWideChar(
@@ -2374,33 +2312,20 @@ protected:
         return std::filesystem::path(wide);
     }
 
-    /// True if the host ABI version and size matched at attach time. When
-    /// false, `m_ctx` is unpopulated and the plugin should refuse to function.
+    // False if the host ABI is incompatible (older host) — services are inert.
     bool HostCompatible() const { return m_host_compatible; }
 
 private:
     friend void ::PluginSDK_AttachHost(Plugin*, const HostAbi*, const char*);
 
     Context     m_ctx{};
-    // Owned-by-value so Directory() never dangles even if the host's
-    // PluginContainer vector reallocates after attach.
+
     std::string m_directory;
     bool        m_host_compatible = false;
 };
 
-}  // namespace PluginSDK
+}
 
-// Lives inside the plugin DLL; the host loader resolves it via GetProcAddress
-// and calls it between CreatePlugin() and OnEnable(). Rejects mismatched
-// version, leaving HostCompatible() false.
-//
-// Size compatibility is one-way: the host may grow `sizeof(HostAbi)` by
-// appending fields (no version bump) as long as existing fields keep their
-// offsets. A plugin compiled against an older (smaller) `sizeof(HostAbi)`
-// therefore accepts a larger host struct because the host's layout is a
-// superset of what the plugin reads. We only reject hosts whose struct is
-// *smaller* than what this plugin was built against — that would mean the
-// host is missing fields the plugin may dereference.
 inline void PluginSDK_AttachHost(PluginSDK::Plugin* p,
                                  const HostAbi*  abi,
                                  const char*        directory) {
@@ -2409,7 +2334,7 @@ inline void PluginSDK_AttachHost(PluginSDK::Plugin* p,
     p->m_host_compatible =
         (abi != nullptr
          && abi->version == PLUGIN_SDK_VERSION
-         && abi->size_bytes >= sizeof(HostAbi));  // append-only growth allowed
+         && abi->size_bytes >= sizeof(HostAbi));
     if (!p->m_host_compatible) return;
 
     p->m_ctx.Game      .Init(&abi->game,       abi);
@@ -2422,7 +2347,7 @@ inline void PluginSDK_AttachHost(PluginSDK::Plugin* p,
     p->m_ctx.Memory    .Init(&abi->memory,     abi);
     p->m_ctx.Log       .Init(&abi->log,        abi);
     p->m_ctx.Events    .Init(&abi->events,     abi);
-    p->m_ctx.Overlay   .Init(&abi->overlay,    abi, p);   // p = plugin_token
+    p->m_ctx.Overlay   .Init(&abi->overlay,    abi, p);
     p->m_ctx.Flasks    .Init(&abi->flasks,     abi);
     p->m_ctx.ImGuiContext = abi->imgui_context;
     p->m_ctx.D3DDevice    = abi->d3d_device;
