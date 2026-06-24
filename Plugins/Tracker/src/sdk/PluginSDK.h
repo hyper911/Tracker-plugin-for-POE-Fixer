@@ -1468,6 +1468,12 @@ public:
         return out;
     }
 
+    // Alias for aggregated enumeration. Keeps backward-compatibility while
+    // callers migrate to `EnumerateAggregatedBuffs`.
+    std::vector<Buff> EnumerateAggregatedBuffs(uintptr_t buffsAddr) const {
+        return EnumerateBuffs(buffsAddr);
+    }
+
     std::vector<ActiveSkill> EnumerateActiveSkills(uintptr_t actorAddr) const {
         std::vector<ActiveSkill> out;
         if (!m_abi || !m_abi->enumerate_active_skills) return out;

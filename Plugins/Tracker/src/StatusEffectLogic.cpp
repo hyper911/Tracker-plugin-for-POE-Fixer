@@ -161,7 +161,7 @@ void StatusEffectLogic::Draw(const PluginSDK::Snapshot& snap, const PluginSDK::C
     if (Settings.ShowPlayerStatusEffects && snap.Player.IsValid) {
         const auto& pe = snap.Player;
         if (pe.Components.HasBuffs()) {
-            auto buffs = ctx->Components.EnumerateBuffs(pe.Components.Buffs);
+            auto buffs = ctx->Components.EnumerateAggregatedBuffs(pe.Components.Buffs);
             drawForEntity(pe, buffs, Settings.PlayerStatusEffects, Settings.PlayerStatusXOffset, Settings.PlayerStatusYOffset, Settings.PlayerStatusIconGap);
         }
     }
@@ -171,7 +171,7 @@ void StatusEffectLogic::Draw(const PluginSDK::Snapshot& snap, const PluginSDK::C
         if (!e.IsValid) continue;
         if (e.EntityType != PluginSDK::EntityType::Monster) continue;
         if (!e.Components.HasBuffs()) continue;
-        auto buffs = ctx->Components.EnumerateBuffs(e.Components.Buffs);
+        auto buffs = ctx->Components.EnumerateAggregatedBuffs(e.Components.Buffs);
         drawForEntity(e, buffs, Settings.StatusEffects, Settings.MonsterStatusXOffset, Settings.MonsterStatusYOffset, Settings.MonsterStatusIconGap);
     }
 }
