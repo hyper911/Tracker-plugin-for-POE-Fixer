@@ -72,6 +72,8 @@ struct TrackerSettings {
     int MonsterStatusXOffset = 0;
     int MonsterStatusYOffset = -42;
     int MonsterStatusIconGap = 4;
+    // when true, show monster status effects only for Rare (2) and Unique (3) monsters
+    bool OnlyShowMonsterStatusEffectsForRareAndAbove = true;
     float TextShadowAlpha = 0.5f;
     int TextShadowSize = 1;
 

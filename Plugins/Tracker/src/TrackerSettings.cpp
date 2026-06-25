@@ -64,6 +64,7 @@ void TrackerSettings::Save(const std::filesystem::path& directory) const {
         out << "  \"MonsterStatusXOffset\":" << MonsterStatusXOffset << ",\n";
         out << "  \"MonsterStatusYOffset\":" << MonsterStatusYOffset << ",\n";
         out << "  \"MonsterStatusIconGap\":" << MonsterStatusIconGap << ",\n";
+        out << "  \"OnlyShowMonsterStatusEffectsForRareAndAbove\":" << (OnlyShowMonsterStatusEffectsForRareAndAbove ? "true" : "false") << ",\n";
         out << "  \"TextShadowAlpha\":" << TextShadowAlpha << ",\n";
         out << "  \"TextShadowSize\":" << TextShadowSize << ",\n";
         out << "  \"ChargesXOffset\":" << ChargesXOffset << ",\n";
@@ -241,6 +242,7 @@ void TrackerSettings::Load(const std::filesystem::path& directory) {
             MonsterStatusXOffset = readInt("MonsterStatusXOffset", MonsterStatusXOffset);
             MonsterStatusYOffset = readInt("MonsterStatusYOffset", MonsterStatusYOffset);
             MonsterStatusIconGap = readInt("MonsterStatusIconGap", MonsterStatusIconGap);
+            OnlyShowMonsterStatusEffectsForRareAndAbove = readBool("OnlyShowMonsterStatusEffectsForRareAndAbove", OnlyShowMonsterStatusEffectsForRareAndAbove);
             TextShadowAlpha = readFloat("TextShadowAlpha", TextShadowAlpha);
             TextShadowSize = readInt("TextShadowSize", TextShadowSize);
             ChargesXOffset = readInt("ChargesXOffset", ChargesXOffset);

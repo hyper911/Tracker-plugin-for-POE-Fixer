@@ -170,6 +170,9 @@ void StatusEffectLogic::Draw(const PluginSDK::Snapshot& snap, const PluginSDK::C
     for (const auto& e : snap.Entities) {
         if (!e.IsValid) continue;
         if (e.EntityType != PluginSDK::EntityType::Monster) continue;
+        // Optionally don't show status effects for monsters with rarity less than Rare
+        // (rarity mapping: 0=normal, 1=magic, 2=rare, 3=unique)
+        if (Settings.OnlyShowMonsterStatusEffectsForRareAndAbove && e.Rarity < 2) continue;
         if (!e.Components.HasBuffs()) continue;
         auto buffs = ctx->Components.EnumerateAggregatedBuffs(e.Components.Buffs);
         drawForEntity(e, buffs, Settings.StatusEffects, Settings.MonsterStatusXOffset, Settings.MonsterStatusYOffset, Settings.MonsterStatusIconGap);
