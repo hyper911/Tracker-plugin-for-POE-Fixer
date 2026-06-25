@@ -249,6 +249,9 @@ public:
     void DrawStatusEffectSettings() {
         if (!ImGui::CollapsingHeader("Monster Status Effects")) return;
         ImGui::Indent();
+        ImGui::Checkbox("Only show monster status effects for Rare+", &m_settings.OnlyShowMonsterStatusEffectsForRareAndAbove);
+        Tooltip("When enabled, status effects are shown only on Rare (and Unique) monsters.");
+        ImGui::Separator();
         ImGui::Text("Horizontal Offset"); ImGui::SameLine(); ImGui::SetNextItemWidth(100); ImGui::SliderInt("##MonsterStatusXOffset", &m_settings.MonsterStatusXOffset, -400, 400);
         ImGui::SameLine(); ImGui::Text("Vertical Offset"); ImGui::SameLine(); ImGui::SetNextItemWidth(100); ImGui::SliderInt("##MonsterStatusYOffset", &m_settings.MonsterStatusYOffset, -400, 400);
         ImGui::SameLine(); ImGui::Text("Gap"); ImGui::SameLine(); ImGui::SetNextItemWidth(90); ImGui::SliderInt("##MonsterStatusIconGap", &m_settings.MonsterStatusIconGap, 0, 50);
